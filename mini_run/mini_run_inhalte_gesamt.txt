@@ -1,0 +1,1081 @@
+┌────────────┐
+│  MMLU CSV  │                               mmlu_pro_all_questions
+└─────┬──────┘
+      │
+      ▼
+┌────────────────────┐
+│ load_csv            │                     mmlu.py
+│ Pflichtspaltencheck │
+└─────┬──────────────┘
+      │
+      ▼
+┌────────────────────┐
+│ Sampling            │                     00_/01_ define n= & random_state 
+│ random_state fix    │
+└─────┬──────────────┘
+      │
+      ▼
+┌────────────────────────────┐
+│ clean_text                  │             io_jsonl.py
+│ parse_options               │
+└─────┬──────────────────────┘
+      │
+      │ optional
+      ▼
+┌────────────────────────────┐
+│ DeepL Translation           │            deepl.translate.py
+│ Cache + Budget Guard        │            00_deepl_translate_mini.py
+└─────┬──────────────────────┘
+      │
+      ▼
+┌────────────────────────────┐
+│ build_prompt                │             prompting_mapping.py
+│ Labels A B C                │             prompt_en.txt
+│ Prompt Hash                 │
+└─────┬──────────────────────┘
+      │
+      ▼
+┌────────────────────────────┐
+│ base_row                    │             logrows.py
+│ Metadaten Initialisierung   │
+└─────┬──────────────────────┘
+      │
+      ▼
+┌────────────────────────────┐
+│ run_tool                    │             clients.py
+│ Exponential Backoff         │
+└─────┬──────────────────────┘
+      │
+      ├───────────────┐
+      ▼               ▼
+┌─────────────┐   ┌─────────────┐
+│ OpenAI API  │   │ Gemini API  │           clients.py
+└─────┬───────┘   └─────┬───────┘
+      │                 │
+      └─────────┬───────┘
+                ▼
+┌────────────────────────────┐
+│ extract_json                │             clients.py
+│ tolerant Parsing            │
+└─────┬──────────────────────┘
+      │
+      ├─ Fail
+      │   ▼
+      │ ┌───────────────────┐
+      │ │ failure_row        │              logrows.py
+      │ │ raw gekürzt        │
+      │ └───────────────────┘
+      │
+      └─ OK
+          ▼
+┌────────────────────────────┐
+│ answer_valid                │
+│ conf_self                   │             logrows.py
+│ latency                     │
+└─────┬──────────────────────┘
+      │
+      ▼
+┌────────────────────────────┐
+│ mini_infer.jsonl            │             
+└─────┬──────────────────────┘
+      │
+      ▼
+┌────────────────────────────┐
+│ Scoring                     │             02_score_results.py
+│ Gold Label Vergleich        │
+└─────┬──────────────────────┘
+      │
+      ▼
+┌────────────────────────────┐
+│ mini_scored.jsonl           │
+│ correct 0 oder 1            │
+└────────────────────────────┘
+
+
+
+
+
+
+
+
+===== file: 00_deepl_translate_mini.py =====
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from lib.mmlu import load_csv, clean_text, parse_options
+from lib.deepl_translate import translate_question_and_options
+from lib.io_jsonl import JsonlStore
+
+N = 1                   # Sample size
+RANDOM_STATE = 99       # Seed
+TARGET_LANG = "DE"
+
+# Dateien & Pfade
+BASE_DIR = Path(__file__).resolve().parent
+CSV_PATH = BASE_DIR.parent / "mmlu_pro_all_questions.csv"
+OUT_TRANSLATED = BASE_DIR / "mini_translated_de.jsonl"
+
+# Pflichtspalten werden aus lib.mmlu geprüft
+df = load_csv(CSV_PATH)
+
+# Mini Sample ziehen
+sample = df.sample(n=N, random_state=RANDOM_STATE).copy()
+
+# JSONL-Store initialisieren
+store = JsonlStore(OUT_TRANSLATED)
+
+# Läuft Zeile für Zeile durch das df => Säuberung
+for _, r in sample.iterrows():
+    qid = int(r["question_id"])
+    question = clean_text(r["question"])
+    options = parse_options(r["options_json"])
+
+    # Deepl Übersetzung für Question und Options
+    q_de, opts_de = translate_question_and_options(question, options, TARGET_LANG)
+    
+    # Schreibt pro Frage eine JSONL-Zeile
+    store.append({
+        "question_id": qid,
+        "lang_src": "EN",
+        "lang_tgt": TARGET_LANG,
+        "question_en": question,
+        "question_de": q_de,
+        "options_en": options,
+        "options_de": opts_de,
+        "deepl_chars_in": len(question) + sum(len(o) for o in options),  # simple budget metric
+    })
+
+print("DeepL mini-run done:", OUT_TRANSLATED) # Terminal-Feedback
+
+===== file: 01_mmlu_pro_infer_mini.py =====
+"""
+
+1) CSV laden
+2) Sample ziehen
+3) Prompt bauen
+4) OpenAI und Gemini infer
+5) Results JSONL schreiben
+6) Failures separat JSONL schreiben
+
+
+now_ts()
+apply_api_result(row, res)
+run_tool(client, prompt, row, labels, infer_store, fail_store)
+main()
+"""
+
+import time
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from lib.io_jsonl import JsonlStore                                   # REF: lib/io_jsonl.py
+from lib.mmlu import load_csv, clean_text, parse_options              # REF: lib/mmlu.py
+from lib.clients import OpenAIClient, GeminiClient, extract_json      # REF: lib/clients.py
+from lib.prompting_mapping import load_text, sha1_10, build_prompt            # REF: lib/prompting.py
+from lib.logrows import base_row, failure_row                         # REF: lib/logrows.py
+from lib.errors import IRPError
+
+
+BASE_DIR = Path(__file__).resolve().parent                   # Flexibler und robuster als "hart" auf Laufwerk (C:\...)
+CSV_PATH = BASE_DIR.parent / "mmlu_pro_all_questions.csv"    # Speicherort & -name
+PROMPT_PATH = BASE_DIR / "prompts" / "prompt_en.txt"         # Speicherort & -name
+
+OUT_INFER = BASE_DIR / "mini_infer.jsonl"                    # Speicherort & -name
+OUT_FAILS = BASE_DIR / "mini_raw_failures.jsonl"             # Speicherort & -name
+
+N = 1                                          # Sample size
+RANDOM_STATE = 111                            # Benutzt immer denselben Seed => die exakt selben Werte
+
+OPENAI_MODEL = "gpt-5.2"
+GEMINI_MODEL = "gemini-2.5-flash"
+
+LANGUAGE = "EN"
+INPUT_MODE = "api"
+
+SCHEMA_VERSION = "v1"
+RUN_ID = "2026-01-07"
+PROMPT_ID = "prompt_en_v1"
+PROMPT_FILE = "prompts/prompt_en.txt"
+
+
+def now_ts():
+    return time.strftime("%Y-%m-%d %H:%M:%S")                       # Timestamp: "2026-01-05 13:39:56"
+
+
+def apply_api_result(row: dict, res: dict) -> None:
+    """
+    Übernimmt Messwerte aus der API Antwort in die Log Row.
+    Damit run_tool lesbarer bleibt.
+    """
+    row["latency_s"] = res.get("latency_s")
+    row["token_out"] = res.get("token_out")
+    row["attempt"] = res.get("attempt")
+    row["error"] = res.get("error")
+    row["error_type"] = res.get("error_type")
+    row["retryable"] = res.get("retryable")
+    row["retry_after_s"] = res.get("retry_after_s")
+
+
+def run_tool(client, prompt: str, row: dict, labels: list[str], infer_store, fail_store):
+    """
+    Einheitlicher Ablauf pro Tool Call.
+
+    1) client.infer(prompt)
+    2) Messwerte in row übernehmen
+    3) Wenn ok False, Failure loggen
+    4) Wenn ok True, JSON extrahieren
+    5) Wenn parse failed, Failure loggen
+    6) Wenn parse ok, answer speichern und row schreiben
+    """
+
+    # 1) Sendet den Prompt an die API
+    res = client.infer(prompt)
+
+    # 2) Übernimmt Messwerte aus der API Antwort
+    apply_api_result(row, res)
+
+    # 3) API Call erfolgreich?
+    if not res.get("ok"):
+        infer_store.append(row)
+        fail_store.append(failure_row(row, stage="api_error", raw=res.get("raw")))
+        return
+
+    # 4) Rohantwort hole, falls None -> leer lassen
+    raw = res.get("raw", "") or ""
+
+    # 5) JSON aus Antwort extrahieren {"answer":"B","confidence":92}
+    parsed = extract_json(raw)
+
+    # 6.1) JSON Parsing failed
+    if parsed is None:
+        row["error"] = "parse_failed"
+        row["error_type"] = "parse"
+        row["retryable"] = False
+        infer_store.append(row)
+        fail_store.append(failure_row(row, stage="parse_failed", raw=raw))
+        return
+
+    # 6.2) JSON Parsing erfolgreich
+    ans = parsed.get("answer")
+    row["answer"] = ans
+    row["conf_self"] = parsed.get("confidence")
+    row["answer_valid"] = bool(ans in labels)       # prüft ob Antwort erlaubt ist
+    infer_store.append(row)
+
+
+def main():
+
+    # 1) Prints im Terminal für Kontrolle
+    print("Reading:", CSV_PATH)
+    print("Prompt:", PROMPT_PATH)
+    print("Writing infer:", OUT_INFER)
+    print("Writing fails:", OUT_FAILS)
+
+    # 2) Alte JSONL-Dateien löschen
+    if OUT_INFER.exists(): OUT_INFER.unlink()
+    if OUT_FAILS.exists(): OUT_FAILS.unlink()
+
+    # 3) JSONL Writer initialisieren
+    infer_store = JsonlStore(OUT_INFER)
+    fail_store = JsonlStore(OUT_FAILS)
+
+    # 4) Daten und Template laden
+    df = load_csv(CSV_PATH)
+    tpl = load_text(PROMPT_PATH)
+    p_sha = sha1_10(tpl)
+
+    # 5) Mini Sample ziehen
+    sample = df.sample(n=N, random_state=RANDOM_STATE).copy()
+
+    # 6) Clients erstellen
+    openai = OpenAIClient(OPENAI_MODEL)
+    gemini = GeminiClient(GEMINI_MODEL)
+
+    schema_cfg = {
+        "SCHEMA_VERSION": SCHEMA_VERSION,
+        "RUN_ID": RUN_ID,
+        "PROMPT_ID": PROMPT_ID,
+        "PROMPT_FILE": PROMPT_FILE,
+        "LANGUAGE": LANGUAGE,
+        "INPUT_MODE": INPUT_MODE,
+        "now_ts": now_ts,
+    }
+
+    # 7) Jede Frage im Sample wiederholen
+    for _, r in sample.iterrows():              # _ wäre ein Index, r eine Zeile von df
+
+        # 8) Meta Felder pro Frage holen
+        qid = int(r["question_id"])
+        domain = str(r["category"])
+        src = str(r["src"])
+
+        # 9) Frage und Optionen aufbereiten
+        question = clean_text(r["question"])
+        options = parse_options(r["options_json"])
+
+        # 10) Prompt zusammenbauen
+        prompt, labels = build_prompt(tpl, question, options)
+
+        # 11) Schutz via Prompt-Länge
+        if len(prompt.strip()) < 50:
+            raise ValueError("Prompt too short - template formatting failed")
+
+        # 12) Überprüfung ob Antwort wirklich nicht in prompt, if True = AssertionError
+        assert "answer_index" not in prompt
+        assert "label_answer" not in prompt
+
+        # 13) Log Row für OpenAI bauen
+        row = base_row("openai", OPENAI_MODEL, qid, domain, src, labels, p_sha, schema_cfg)
+        run_tool(openai, prompt, row, labels, infer_store, fail_store)
+
+        # 14) Log Row für Gemini bauen
+        row = base_row("gemini", GEMINI_MODEL, qid, domain, src, labels, p_sha, schema_cfg)
+        run_tool(gemini, prompt, row, labels, infer_store, fail_store)
+
+    print("Done:", OUT_INFER)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except IRPError as e:
+        print("Project error:", e)
+        raise
+
+
+
+
+
+===== file: 02_score_results.py =====
+from pathlib import Path
+
+from lib.io_jsonl import JsonlStore
+from lib.mmlu import load_csv, parse_options, gold_letter
+
+
+BASE_DIR = Path(__file__).resolve().parent
+
+CSV_PATH = BASE_DIR.parent / "mmlu_pro_all_questions.csv"
+INFER_JSONL = BASE_DIR / "mini_infer.jsonl"
+OUT_JSONL = BASE_DIR / "mini_scored.jsonl"
+
+
+def main():
+
+    # 1) Lade die Modell Resultate (Predictions) aus mini_infer.jsonl
+    infer_rows = JsonlStore(INFER_JSONL).read_all()
+
+    # 2) Sammle alle question_ids, die in den Predictions vorkommen
+    needed_ids = set()
+    for row in infer_rows:                              # Loop für jede Prediction aus dem Log
+        if "question_id" in row:
+            needed_ids.add(int(row["question_id"]))     # ID Str -> Int
+
+    # 3) Lade das CSV und baue eine Map: question_id -> gold_answer_letter
+    df = load_csv(CSV_PATH)
+    gold_by_qid = {}
+
+    for _, r in df.iterrows():             # Loop für jede Zeile des df CSV
+        qid = int(r["question_id"])        # IDs sammeln
+
+        # Wenn diese Frage nicht im Set der Predictions ist -> überspringen
+        if qid not in needed_ids:
+            continue
+
+        options = parse_options(r["options_json"])              # JSON str -> Python Liste
+        answer_index = int(r["answer_index"])                   # Option als Zahl korrekt?
+        gold_by_qid[qid] = gold_letter(answer_index, options)   # Speichert Buchstaben in die Map       
+
+    # 4) Löscht altes scored File, erstellt neues
+    if OUT_JSONL.exists():
+        OUT_JSONL.unlink()
+    out_store = JsonlStore(OUT_JSONL)
+
+    # 5) Jede Prediction bewerten und speichern
+    for row in infer_rows:
+        qid = int(row["question_id"])
+        pred = row.get("answer")
+        gold = gold_by_qid.get(qid)
+        row["label_answer_letter"] = gold
+
+        if gold is None or pred is None:
+            row["correct"] = None
+        else:
+            row["correct"] = int(pred == gold)  # Vergleicht Prediction mit Gold: 1 oder 0
+
+        out_store.append(row)                   # Schreibt die fertige Zeile ins JSONL File
+
+    print("Wrote:", OUT_JSONL)                  # Informativ fürs Terminal 
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+===== file: lib\__init__.py =====
+# dank dieser datei können die hier erstellten files als libraries impotiert werden
+
+===== file: lib\clients.py =====
+# API Communication
+
+import time
+import os
+import json
+from openai import OpenAI
+from google import genai
+
+from .errors import ConfigError
+
+
+MAX_RETRIES = 5          # Max. Wiederholungen
+BASE_SLEEP = 1.0         # Start-Wartezeit (Sek.)
+MAX_SLEEP = 30.0         # Max. Wartezeit
+ERR_LIMIT = 240          # Max. Länge Error-Text
+
+
+def sleep_backoff(attempt: int):
+    seconds = min(MAX_SLEEP, BASE_SLEEP * (2 ** (attempt - 1)))
+    time.sleep(seconds)
+"""
+Exponentialer Backoff pro Versuch.
+attempt 1 -> 1.0 Sekunde
+attempt 2 -> 2.0 Sekunden
+attempt 3 -> 4.0 Sekunden
+Wartezeit wächst mit Potenz von 2.
+min(MAX_SLEEP, ...) setzt eine Obergrenze von 30.0 Sekunden.
+"""
+
+
+def extract_json(text: str):
+    if not text:
+        return None
+
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Try to extract the first JSON object from surrounding text.
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = text[start : i + 1]
+                try:
+                    return json.loads(candidate)
+                except Exception:
+                    return None
+
+    return None
+
+
+def _openai_temperature(model: str):
+    # Some models (e.g. gpt-5-nano) only accept the default temperature.
+    if model.startswith("gpt-5"):
+        return None
+    return 0.0
+
+
+def _gemini_text(resp) -> str:
+    text = getattr(resp, "text", None)
+    if text:
+        return text
+
+    candidates = getattr(resp, "candidates", None)
+    if candidates:
+        cand0 = candidates[0]
+        content = getattr(cand0, "content", None)
+        if content is not None:
+            content_text = getattr(content, "text", None)
+            if content_text:
+                return content_text
+            parts = getattr(content, "parts", None)
+            if parts:
+                texts = []
+                for part in parts:
+                    part_text = getattr(part, "text", None)
+                    if part_text:
+                        texts.append(part_text)
+                if texts:
+                    return "".join(texts)
+
+    choices = getattr(resp, "choices", None)
+    if choices:
+        try:
+            return choices[0].message.content
+        except Exception:
+            pass
+
+    return ""
+
+
+# OpenAI Client:
+class OpenAIClientEasy:
+    def __init__(self, model: str):
+        self.client = OpenAI()      # Holt Key selbständig
+        self.model = model
+
+    # OpenAI SDK => Role Based Prompting (System - User) -> chat.completions.create()
+    def infer(self, prompt: str) -> dict:
+        for attempt in range(1, MAX_RETRIES + 1):
+            t0 = time.time()
+            try:
+                req = {
+                    "model": self.model,                          # welches modell soll antworten
+                    "messages": [
+                        # System Message
+                        {"role": "system", "content": "Return only the final answer."},
+                        # User Message
+                        {"role": "user", "content": prompt},
+                    ],
+                }
+                temp = _openai_temperature(self.model)
+                if temp is not None:
+                    req["temperature"] = temp
+
+                resp = self.client.chat.completions.create(**req)    # API request
+
+                return {
+                    "ok": True,
+                    "attempt": attempt,
+                    "latency_s": round(time.time() - t0, 3),
+                    "raw": resp.choices[0].message.content,
+                    "token_out": getattr(getattr(resp, "usage", None), "completion_tokens", None),
+                    "error": None,
+                    "error_type": None,
+                    "retryable": None,
+                    "retry_after_s": None,
+                }
+
+            except Exception as e:
+                if attempt == MAX_RETRIES:
+                    return {
+                        "ok": False,
+                        "attempt": attempt,
+                        "latency_s": round(time.time() - t0, 3),
+                        "raw": None,
+                        "token_out": None,
+                        "error": str(e)[:ERR_LIMIT],
+                        "error_type": type(e).__name__,
+                        "retryable": None,
+                        "retry_after_s": None,
+                    }
+
+                sleep_backoff(attempt)
+
+
+# Gemini Client:
+class GeminiClientEasy:
+    def __init__(self, model: str):
+        key = os.getenv("GOOGLE_API_KEY")             # Ich muss den Key selbst holen
+        if not key:
+            raise ConfigError("GOOGLE_API_KEY missing")
+
+        self.client = genai.Client(api_key=key)
+        self.model = model
+
+    # Gemini SDK => Single Prompt API -> models.generate_content()
+    def infer(self, prompt: str) -> dict:
+        for attempt in range(1, MAX_RETRIES + 1):
+            t0 = time.time()
+            try:
+                resp = self.client.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
+                    config=genai.types.GenerateContentConfig(
+                        temperature=0.0,
+                    )
+                )
+
+                return {
+                    "ok": True,
+                    "attempt": attempt,
+                    "latency_s": round(time.time() - t0, 3),
+                    "raw": _gemini_text(resp),
+                    "token_out": None,
+                    "error": None,
+                    "error_type": None,
+                    "retryable": None,
+                    "retry_after_s": None,
+                }
+
+            except Exception as e:
+                if attempt == MAX_RETRIES:
+                    return {
+                        "ok": False,
+                        "attempt": attempt,
+                        "latency_s": round(time.time() - t0, 3),
+                        "raw": None,
+                        "token_out": None,
+                        "error": str(e)[:ERR_LIMIT],
+                        "error_type": type(e).__name__,
+                        "retryable": None,
+                        "retry_after_s": None,
+                    }
+
+                sleep_backoff(attempt)
+
+
+class OpenAIClient(OpenAIClientEasy):
+    pass
+
+
+class GeminiClient(GeminiClientEasy):
+    pass
+
+===== file: lib\deepl_cache.json =====
+{
+  "2b7ca52649829e4b4ac556df6014528be4a043aa": "Die Gleichung E = mc^2 besagt, dass Energie",
+  "37f479001115bed871aad4b39f9e5a458400b4e1": "und Masse sind eng miteinander verbunden.",
+  "cfbafc4cfc6be9418796d4e6b75d9bc724f0d586": "ist gleich dem Quadrat der Lichtgeschwindigkeit.",
+  "c34e461c47c8827acc22c9b069cf9478739baceb": "entspricht der bewegten Masse.",
+  "70a6a4407366d29c257a9476790e11457f565f29": "ist etwas grundlegend anderes als Masse.",
+  "0936d35e5b7920cf861d25668254af5d2f54367b": "ist gleich Masse geteilt durch die Lichtgeschwindigkeit zum Quadrat.",
+  "f86b11bfa9c5f8e0a0955041e85ccaeb7aae1829": "und Masse haben überhaupt nichts miteinander zu tun.",
+  "edf1aec53a478c3854fcb6b411e298546b99bcfd": "ist gleich der Summe aus Masse und Lichtgeschwindigkeit zum Quadrat.",
+  "cf9a4ca7b34026b023119d1b91a38e087c738b8a": "ist umgekehrt proportional zur Masse.",
+  "8ce6695e6061b26d242ff4223f8d329f16c14224": "entspricht der Masse, die sich mit Lichtgeschwindigkeit zum Quadrat bewegt.",
+  "6ccb512017584c74f77cce6a5b374002667c6685": "entspricht der Masse multipliziert mit der Lichtgeschwindigkeit.",
+  "66270069f8237307dd32e3588244b2800e2ac197": "Ein Gas gehorcht der Vander-Waals-Gleichung, mit P_c = 30atm und T_c= 200°C. Der Kompressibilitätsfaktor PV/RT wird größer als eins sein (bei P = 50atm, T = 250°C; bei P = 1atm, T = 100°C; P = 500atm, T = 500°C; keines davon). Berechnen Sie die vanderWaals-Konstante b für dieses Gas.",
+  "0fd3b1f1e4aad87919a87f394c5f43fd1d7256af": "0,081 Liter/Mol",
+  "0c3f73eec9b6cd29b561f04e6cbef41373aafe25": "0,32 Liter/Mol",
+  "56963cc3915306e7a0de81800015bbc515b44b37": "0,05 Liter/Mol",
+  "5365d7bed803b406d968ca8e1d28e6f1edf3a40d": "0,2424 Liter/Mol",
+  "92748d83962b10bf6a093ebb3f4414a636b205cd": "0,1 atm/mol",
+  "1a61e4cc7d48593df9e849e4d1785361cb9504fb": "0,64 Liter/Mol",
+  "7ade1c150158b57ee228821b87ebd3664efba6e4": "0,4848 Liter/Mol",
+  "dfd81eb3596bcaf926898af118792888f27f838a": "0,324 Liter/Mol",
+  "89ec104fc06ec5d6acdfd0f4997b4a7db33fcfd1": "0,162 atm/mol",
+  "789214103a7dbb9592c4820c2b540924d9a59ae8": "0,162 Liter/Mol"
+}
+
+===== file: lib\deepl_translate.py =====
+import os
+import json
+from pathlib import Path
+import hashlib
+
+from .errors import ConfigError, APIError, DataError
+
+CACHE_PATH = Path(__file__).resolve().parent / "deepl_cache.json"
+USAGE_PATH = Path(__file__).resolve().parent / "deepl_usage.json"
+
+PERSONAL_CHAR_LIMIT = 20_000  # DeepL monthly Limit is 500'000
+
+def _load_json(path: Path, default):
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise DataError(f"Could not read {path} ({e})")
+
+def _save_json(path: Path, obj):
+    try:
+        path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        raise DataError(f"Could not write {path} ({e})")
+
+def _key(text: str, target_lang: str) -> str:
+    h = hashlib.sha1((target_lang + "|" + text).encode("utf-8")).hexdigest()
+    return h
+
+def _get_used_chars() -> int:
+    usage = _load_json(USAGE_PATH, {"used_chars": 0})
+    return int(usage.get("used_chars", 0))
+
+def _add_used_chars(n: int) -> None:
+    usage = _load_json(USAGE_PATH, {"used_chars": 0})
+    usage["used_chars"] = int(usage.get("used_chars", 0)) + int(n)
+    _save_json(USAGE_PATH, usage)
+
+def translate_text(text: str, target_lang: str, source_lang: str = "EN") -> str:
+    """
+    Translates text using DeepL with:
+    - caching
+    - monthly character budget protection
+    """
+    text = text or ""
+    if not text.strip():
+        return text
+
+    auth = os.getenv("DEEPL_API_KEY")
+    if not auth:
+        raise ConfigError("DEEPL_API_KEY missing")
+
+    cache = _load_json(CACHE_PATH, {})
+    k = _key(text, target_lang)
+    if k in cache:
+        return cache[k]
+
+    # Budget check BEFORE calling API
+    used = _get_used_chars()
+    needed = len(text)
+    if used + needed > PERSONAL_CHAR_LIMIT:
+        # No translation, return original (or raise if you prefer)
+        return text
+
+    try:
+        import deepl
+        translator = deepl.Translator(auth)
+        res = translator.translate_text(
+            text,
+            source_lang=source_lang,
+            target_lang=target_lang
+        )
+        out = str(res)
+    except Exception as e:
+        raise APIError(f"DeepL translate failed ({e})")
+
+    cache[k] = out
+    _save_json(CACHE_PATH, cache)
+    _add_used_chars(needed)
+    return out
+
+def translate_question_and_options(question: str, options: list[str], target_lang: str) -> tuple[str, list[str]]:
+    q_t = translate_text(question, target_lang=target_lang)
+    opts_t = [translate_text(o, target_lang=target_lang) for o in options]
+    return q_t, opts_t
+
+===== file: lib\deepl_usage.json =====
+{
+  "used_chars": 1415
+}
+
+===== file: lib\errors.py =====
+class IRPError(Exception):
+    """Base error for this project."""
+    pass
+
+class ConfigError(IRPError):
+    pass
+
+class DataError(IRPError):
+    pass
+
+class APIError(IRPError):
+    pass
+
+
+
+"""
+Gleicher code, verschiedene Reaktionen!
+
+    try:
+        load_config()
+        load_data()
+        call_api()
+    except APIError:
+        print("API kaputt")
+    except DataError:
+        print("Daten kaputt")
+    except ConfigError:
+        print("Config kaputt")
+
+
+Fehlerhierarchie:
+
+IRPError
+ ├── ConfigError
+ ├── DataError
+ └── APIError
+ 
+    """
+
+===== file: lib\io_jsonl.py =====
+# Persistent
+
+import json
+from pathlib import Path
+
+from .errors import DataError           # REF: lib/errors.py
+
+
+
+
+class JsonlStore:      
+    def __init__(self, path: Path):     # Erstellt Unter-/Ordner auch wenn bereits existiert
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def append(self, row):              # Sicherheitscheck -> verhindert kaputte JSON-Zeilen
+        if row is None:
+            return
+
+        try:
+            with self.path.open("a", encoding="utf-8") as f:         # "a" append (ans Ende hängen)
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")  # jede Zeile ein Objekt
+        except Exception as e:
+            raise DataError(f"Could not write JSONL: {self.path} ({e})")
+
+    def read_all(self):                     # Output immer eine Liste von Dictionaries
+        if not self.path.exists():          # Wenn Datei nicht existiert => leere Liste
+            return []
+
+        try:
+            with self.path.open("r", encoding="utf-8") as f:     # "r" Lesemodus
+                result = []                                      # sammelt alle Datensätze
+                for line in f:                                   # Datei wird zeilenweise gelesen
+                    if line.strip():                             # ignoriert leere Zeilen
+                        result.append(json.loads(line))     
+                return result
+        except Exception as e:
+            raise DataError(f"Could not read JSONL: {self.path} ({e})")
+
+===== file: lib\logrows.py =====
+def base_row(
+    tool: str,
+    model: str,
+    qid: int,
+    domain: str,
+    src: str,
+    labels: list[str],
+    p_sha: str,
+    schema_cfg: dict,
+) -> dict:
+    now_ts = schema_cfg.get("now_ts")
+    ts = now_ts() if callable(now_ts) else None
+
+    return {
+        "schema_version": schema_cfg.get("SCHEMA_VERSION"),
+        "run_id": schema_cfg.get("RUN_ID"),
+        "prompt_id": schema_cfg.get("PROMPT_ID"),
+        "prompt_sha1": p_sha,
+        "prompt_file": schema_cfg.get("PROMPT_FILE"),
+        "ts": ts,
+        "tool": tool,
+        "input_mode": schema_cfg.get("INPUT_MODE"),
+        "model": model,
+        "question_id": qid,
+        "domain": domain,
+        "language": schema_cfg.get("LANGUAGE"),
+        "src": src,
+        "n_options": len(labels),
+        "labels": ",".join(labels),
+        "latency_s": None,
+        "token_out": None,
+        "attempt": None,
+        "answer": None,
+        "answer_valid": None,
+        "conf_self": None,
+        "error": None,
+        "error_type": None,
+        "retryable": None,
+        "retry_after_s": None,
+    }
+
+
+def failure_row(
+    base: dict,
+    stage: str,
+    raw: str | None = None,
+    error: str | None = None,
+    **kwargs,
+) -> dict:
+    fr = {
+        "ts": base.get("ts"),
+        "run_id": base.get("run_id"),
+        "tool": base.get("tool"),
+        "model": base.get("model"),
+        "question_id": base.get("question_id"),
+        "domain": base.get("domain"),
+        "language": base.get("language"),
+        "stage": stage,
+        "error": base.get("error"),
+        "error_type": base.get("error_type"),
+        "retryable": base.get("retryable"),
+        "retry_after_s": base.get("retry_after_s"),
+    }
+
+    if error is not None:
+        fr["error"] = error
+
+    if raw is not None:
+        fr["raw"] = (raw or "")[:2000]
+
+    for k, v in kwargs.items():
+        fr[k] = v
+
+    return fr
+
+===== file: lib\mmlu.py =====
+"""
+load_csv: liest dein MMLU-CSV als DataFrame
+clean_text: säubert Frage-Text (whitespace, control chars)
+parse_options: macht aus options_json (String) -> Liste von Optionen
+
+CSV
+ └─ load_csv()
+      └─ question row
+           └─ parse_options()
+                └─ labels_for()
+                     └─ gold_letter()
+"""
+
+import json
+import re
+from pathlib import Path
+
+import pandas as pd
+
+from .errors import DataError
+
+
+# Hat das CSV diese Spalten?
+NEEDED_COLS = ["question_id", "category", "question", "options_json", "answer_index", "src"]
+
+
+def clean_text(s) -> str:       # Basic cleanup for text
+
+    if s is None:
+        return ""
+
+    # statt crash bei None => leere Zelle ""
+    s = str(s)                 
+
+    # remove control characters
+    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", s) 
+
+    # Mehrere Spaces/Tabs werden zu einem Space
+    s = re.sub(r"[ \t]+", " ", s)
+
+    # Wenn es 3+ neue Zeilen hast → macht nur 2
+    s = re.sub(r"\n{3,}", "\n\n", s)
+
+    # Trimmt vorne/hinten whitespace
+    return s.strip()
+
+
+def parse_options(options_json: str) -> list[str]:  # Options: ["Paris", "London", "Berlin"]
+
+    try:
+        opts = json.loads(options_json)             # String → Python-Objekt
+    except Exception:
+        return []
+
+    if not isinstance(opts, list):                  # Muss eine Liste sein
+        return []
+
+    return [clean_text(x) for x in opts]            # text cleanen
+
+
+# Dynamisches Setup statt hardcoden
+def labels_for(options: list[str]) -> list[str]:    # Zu jeder Option ein Buchstaben erzeugen
+    labels = []                                     # erzeugt eine Liste
+    for i in range(len(options)):                   # 0, 1, 2...
+        labels.append(chr(ord("A") + i))            # "A", "B", "C"...
+    return labels
+
+
+# Antwort prüfen
+def gold_letter(answer_index: int, options: list[str]): 
+    if 0 <= answer_index < len(options):                    # Antwortindex muss höher als 0 sein
+        return chr(ord("A") + answer_index)                 # Buchstaben für Antwort zurückgeben
+    return None
+
+
+def load_csv(csv_path: str | Path) -> pd.DataFrame:
+    csv_path = Path(csv_path)
+
+    # Datei gefunden?
+    try:
+        df = pd.read_csv(csv_path, encoding="utf-8")                
+    except Exception as e:
+        raise DataError(f"Could not read CSV: {csv_path} ({e})") 
+
+    # Spalten prüfen
+    missing = []
+    for c in NEEDED_COLS:
+        if c not in df.columns:
+            missing.append(c)
+
+    # Abbruch bei Fehler
+    if missing:
+        raise DataError(f"CSV missing columns: {missing}")
+
+    return df
+
+
+===== file: lib\prompting_mapping.py =====
+import hashlib
+from pathlib import Path
+
+from .mmlu import labels_for
+
+
+def load_text(path: str | Path) -> str:
+    return Path(path).read_text(encoding="utf-8")
+
+
+def sha1_10(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
+
+
+def build_prompt(template: str, question: str, options: list[str]) -> tuple[str, list[str]]:
+    labels = labels_for(options)
+    options_block = "\n".join(f"{label}. {option}" for label, option in zip(labels, options))
+    prompt = template.format(
+        question=question,
+        options=options_block,
+        labels=",".join(labels),
+    )
+    return prompt, labels
+
+===== file: mini_infer.jsonl =====
+{"schema_version": "v1", "run_id": "2026-01-07", "prompt_id": "prompt_en_v1", "prompt_sha1": "5c2622d694", "prompt_file": "prompts/prompt_en.txt", "ts": "2026-01-12 11:26:42", "tool": "openai", "input_mode": "api", "model": "gpt-5.2", "question_id": 1313, "domain": "law", "language": "EN", "src": "ori_mmlu-professional_law", "n_options": 9, "labels": "A,B,C,D,E,F,G,H,I", "latency_s": 2.219, "token_out": 12, "attempt": 1, "answer": "H", "answer_valid": true, "conf_self": 92, "error": null, "error_type": null, "retryable": null, "retry_after_s": null}
+{"schema_version": "v1", "run_id": "2026-01-07", "prompt_id": "prompt_en_v1", "prompt_sha1": "5c2622d694", "prompt_file": "prompts/prompt_en.txt", "ts": "2026-01-12 11:26:44", "tool": "gemini", "input_mode": "api", "model": "gemini-2.5-flash", "question_id": 1313, "domain": "law", "language": "EN", "src": "ori_mmlu-professional_law", "n_options": 9, "labels": "A,B,C,D,E,F,G,H,I", "latency_s": 10.709, "token_out": null, "attempt": 1, "answer": "H", "answer_valid": true, "conf_self": 95, "error": null, "error_type": null, "retryable": null, "retry_after_s": null}
+
+===== file: mini_scored.jsonl =====
+{"schema_version": "v1", "run_id": "2026-01-07", "prompt_id": "prompt_en_v1", "prompt_sha1": "5c2622d694", "prompt_file": "prompts/prompt_en.txt", "ts": "2026-01-08 16:44:29", "tool": "openai", "input_mode": "api", "model": "gpt-5.2", "question_id": 6344, "domain": "health", "language": "EN", "src": "ori_mmlu-medical_genetics", "n_options": 10, "labels": "A,B,C,D,E,F,G,H,I,J", "latency_s": 2.387, "token_out": 12, "attempt": 1, "answer": "E", "answer_valid": true, "conf_self": 99, "error": null, "error_type": null, "retryable": null, "retry_after_s": null, "label_answer_letter": "E", "correct": 1}
+{"schema_version": "v1", "run_id": "2026-01-07", "prompt_id": "prompt_en_v1", "prompt_sha1": "5c2622d694", "prompt_file": "prompts/prompt_en.txt", "ts": "2026-01-08 16:44:31", "tool": "gemini", "input_mode": "api", "model": "gemini-3-pro-preview", "question_id": 6344, "domain": "health", "language": "EN", "src": "ori_mmlu-medical_genetics", "n_options": 10, "labels": "A,B,C,D,E,F,G,H,I,J", "latency_s": 7.257, "token_out": null, "attempt": 1, "answer": "E", "answer_valid": true, "conf_self": 100, "error": null, "error_type": null, "retryable": null, "retry_after_s": null, "label_answer_letter": "E", "correct": 1}
+
+===== file: mini_translated_de.jsonl =====
+{"question_id": 318, "lang_src": "EN", "lang_tgt": "DE", "question_en": "Ms. Fogg is planning an around-the-world trip on which she plans to spend $10,000. The utility from the trip is a function of how much she actually spends on it (Y), given by U(Y) = ln Y. If there is a 25 percent probability that Ms. Fogg will lose $1,000 of her cash on the trip, what is the trip\u2019s expected utility?", "question_de": "Frau Fogg plant eine Weltreise, f\u00fcr die sie 10.000 $ ausgeben will. Der Nutzen der Reise ist eine Funktion des Betrags, den sie tats\u00e4chlich daf\u00fcr ausgibt (Y), gegeben durch U(Y) = ln Y. Wenn es eine 25-prozentige Wahrscheinlichkeit gibt, dass Frau Fogg 1.000 $ ihres Geldes auf der Reise verliert, wie hoch ist der erwartete Nutzen der Reise?", "options_en": ["8.895", "9.350", "9.210", "9.000", "8.500", "10.000", "9.184", "8.987", "8.750"], "options_de": ["8.895", "9.350", "9.210", "9.000", "8.500", "10.000", "9.184", "8.987", "8.750"], "deepl_chars_in": 363}
+{"question_id": 5857, "lang_src": "EN", "lang_tgt": "DE", "question_en": "Which type of writing employs the pyramid structure?", "question_de": "Bei welcher Art von Schreiben wird die Pyramidenstruktur verwendet?", "options_en": ["Academic writing", "Personal writing", "Scientific writing", "Media writing", "Reflective writing", "Legal writing", "Promotional writing", "Technical writing", "Creative writing"], "options_de": ["Akademisches Schreiben", "Pers\u00f6nliches Schreiben", "Wissenschaftliches Schreiben", "Schreiben in den Medien", "Reflektierendes Schreiben", "Juristisches Schreiben", "Werbetexte", "Technisches Schreiben", "Kreatives Schreiben"], "deepl_chars_in": 198}
+{"question_id": 10169, "lang_src": "EN", "lang_tgt": "DE", "question_en": "The equation E = mc^2 indicates that energy", "question_de": "Die Gleichung E = mc^2 besagt, dass Energie", "options_en": ["and mass are closely related.", "is equal to the square of the speed of light.", "equals moving mass.", "is fundamentally different than mass.", "equals mass divided by the speed of light squared.", "and mass are not related at all.", "equals the sum of mass and the speed of light squared.", "is inversely proportional to mass.", "equals mass moving at the speed of light squared.", "equals mass multiplied by the speed of light."], "options_de": ["und Masse sind eng miteinander verbunden.", "ist gleich dem Quadrat der Lichtgeschwindigkeit.", "entspricht der bewegten Masse.", "ist etwas grundlegend anderes als Masse.", "ist gleich Masse geteilt durch die Lichtgeschwindigkeit zum Quadrat.", "und Masse haben \u00fcberhaupt nichts miteinander zu tun.", "ist gleich der Summe aus Masse und Lichtgeschwindigkeit zum Quadrat.", "ist umgekehrt proportional zur Masse.", "entspricht der Masse, die sich mit Lichtgeschwindigkeit zum Quadrat bewegt.", "entspricht der Masse multipliziert mit der Lichtgeschwindigkeit."], "deepl_chars_in": 437}
+{"question_id": 3594, "lang_src": "EN", "lang_tgt": "DE", "question_en": "A gas obeys the vanderWaals equation, with P_c = 30atm andT_c= 200\u00b0C. The compressibility factor PV/RT will be more than one (at P = 50atm, T = 250\u00b0C; at P = 1atm, T = 100\u00b0C; P = 500atm, T = 500\u00b0C; none of these). Calculate the vanderWaals constant b for this gas.", "question_de": "Ein Gas gehorcht der Vander-Waals-Gleichung, mit P_c = 30atm und T_c= 200\u00b0C. Der Kompressibilit\u00e4tsfaktor PV/RT wird gr\u00f6\u00dfer als eins sein (bei P = 50atm, T = 250\u00b0C; bei P = 1atm, T = 100\u00b0C; P = 500atm, T = 500\u00b0C; keines davon). Berechnen Sie die vanderWaals-Konstante b f\u00fcr dieses Gas.", "options_en": ["0.081 liter/mole", "0.32 liter/mole", "0.05 liter/mole", "0.2424 liter/mole", "0.1 atm/mole", "0.64 liter/mole", "0.4848 liter/mole", "0.324 liter/mole", "0.162 atm/mole", "0.162 liter/mole"], "options_de": ["0,081 Liter/Mol", "0,32 Liter/Mol", "0,05 Liter/Mol", "0,2424 Liter/Mol", "0,1 atm/mol", "0,64 Liter/Mol", "0,4848 Liter/Mol", "0,324 Liter/Mol", "0,162 atm/mol", "0,162 Liter/Mol"], "deepl_chars_in": 417}
+
+===== file: prompts\prompt_en.txt =====
+You must output ONLY one valid JSON object and nothing else.
+No markdown, no code fences.
+Format exactly: {{"answer":"<LETTER>","confidence":<0-100>}}
+Allowed answers: {labels}
+
+Question:
+{question}
+
+Options:
+{options}
+
+
+
+
+
+
+
+===== skipped files (binary or unreadable) =====
+lib\__pycache__\__init__.cpython-314.pyc
+lib\__pycache__\clients.cpython-314.pyc
+lib\__pycache__\deepl_translate.cpython-314.pyc
+lib\__pycache__\errors.cpython-314.pyc
+lib\__pycache__\io_jsonl.cpython-314.pyc
+lib\__pycache__\logrows.cpython-314.pyc
+lib\__pycache__\mmlu.cpython-314.pyc
+lib\__pycache__\prompting.cpython-314.pyc
+lib\__pycache__\prompting_mapping.cpython-314.pyc

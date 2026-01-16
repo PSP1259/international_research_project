@@ -1,0 +1,16 @@
+You must output ONLY one valid JSON object and nothing else.
+No markdown, no code fences.
+Format exactly: {{"answer":"<LETTER>","confidence":<0-100>}}
+Allowed answers: {labels}
+
+Question:
+{question}
+
+Options:
+{options}
+
+
+
+
+
+
