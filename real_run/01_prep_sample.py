@@ -38,7 +38,7 @@ def create_sample():
     df_all = pd.read_csv(INPUT_FILE, encoding="utf-8")
   except Exception as e:
     print(f"Fehler beim Lesen der CSV: {e}")
-    return  # << wichtig
+    return 
 
   print(f"Gesamtanzahl Fragen im Original: {len(df_all)}")
 
@@ -66,7 +66,7 @@ def create_sample():
     final_df = pd.concat(sampled_frames, ignore_index=True)
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-    final_df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8")  # << DAS hat gefehlt
+    final_df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8")  
     print(f"Sample gespeichert in: {OUTPUT_FILE}")
     print(f"Anzahl Fragen im Sample: {len(final_df)}")
   else:

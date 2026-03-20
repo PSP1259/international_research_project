@@ -13,7 +13,7 @@ config = {
     "is_reasoning": False,    # Temperature 0.0
     "language": "EN",
     "sleep_seconds": 2.0,
-    "max_questions": 40      
+    "max_questions": 300      
 }
 
 

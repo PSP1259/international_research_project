@@ -2,6 +2,8 @@ import pandas as pd
 import json
 import time
 import os
+import re
+import unicodedata
 from pathlib import Path
 from lib.ai_client import AIClient
 
@@ -18,24 +20,29 @@ INPUT_FILE = BASE_DIR / "data" / "mmlu_ready_bilingual.csv"
 PROMPT_TEMPLATES = {
   "EN": """
   Question: {question}
-  Options:
-  {options}
+  Options: {options}
 
-  Select the correct option letter (A, B, C, ...).
-  Return ONLY a JSON object using this format (replace values with your result):
+  INSTRUCTIONS:
+  1. Solve the question.
+  3. Determine your confidence (0-100).
+  4. Return ONLY a JSON object.
+  Example JSON format:
   {{
-    "answer_char": "X",
+    "answer_char": "x", 
     "confidence": 0
   }}
   """,
 
   "DE": """
   Frage: {question}
-  Optionen:
-  {options}
+  Optionen: {options}
 
-  Waehle den korrekten Buchstaben (A, B, C, ...).
-  Antworte NUR mit einem JSON-Objekt in diesem Format (ersetze die Platzhalter!):
+  ANLEITUNG:
+  1. Löse die Frage.
+  2. Bestimme deine Sicherheit (0-100).
+  3. Antworte NUR mit einem JSON Objekt.
+
+  Beispiel JSON Format:
   {{
     "answer_char": "X",
     "confidence": 0
@@ -44,64 +51,125 @@ PROMPT_TEMPLATES = {
 }
 
 
-def _parse_options(opts_text):
-  try:
-    opts = json.loads(opts_text)
-  except Exception:
-    return []
-  if not isinstance(opts, list):
-    return []
-  return [str(x).strip() for x in opts]
-
-
-def _labels_for(options):
-  return [chr(ord("A") + i) for i in range(len(options))]
-
-
-def _format_options(options, labels):
-  lines = []
-  for label, option in zip(labels, options):
-    lines.append(f"{label}) {option}")
-  return "\n".join(lines)
-
-
-def _normalize_text(value):
-  return " ".join(str(value).strip().split()).lower()
+LABEL_RE = re.compile(r"^\W*([A-Z])\b")
+OPTION_INDEX_RE = re.compile(r"^\s*OPTION\s+(\d{1,2})\s*$", re.IGNORECASE)
 
 
 def _normalize_label(value):
-  if value is None:
+  if pd.isna(value):
     return None
-  label = str(value).strip().upper()
-  return label if label else None
+
+  text = str(value).strip().upper()
+  if not text:
+    return None
+
+  match = LABEL_RE.match(text)
+  return match.group(1) if match else None
 
 
-def _normalize_answer(answer_raw, options, labels):
-  if answer_raw is None:
+def _repair_text(value):
+  if pd.isna(value):
     return None
-  raw = str(answer_raw).strip()
-  if raw == "":
-    return None
-  if not labels:
-    return raw
 
-  raw_upper = raw.upper()
-  for label in labels:
-    if raw_upper == label:
+  text = str(value)
+  try:
+    repaired = text.encode("latin-1").decode("utf-8")
+  except (UnicodeEncodeError, UnicodeDecodeError):
+    return text
+
+  def _marker_score(candidate):
+    return sum(candidate.count(marker) for marker in ("Ã", "â", "\x80", "\x81", "�"))
+
+  return repaired if _marker_score(repaired) < _marker_score(text) else text
+
+
+def _normalize_text(value):
+  text = _repair_text(value)
+  if text is None:
+    return None
+
+  text = " ".join(text.strip().upper().split())
+  return text or None
+
+
+def _normalize_lookup_key(value):
+  text = _normalize_text(value)
+  if not text:
+    return None
+
+  text = unicodedata.normalize("NFKD", text)
+  text = re.sub(r"\\[A-Z]+", "", text)
+  text = text.replace("VOLTS", "VOLT").replace("DOLLARS", "DOLLAR")
+  text = "".join(ch for ch in text if not unicodedata.combining(ch))
+  text = re.sub(r"[^A-Z0-9]+", "", text)
+  return text or None
+
+
+def _safe_load_options(value):
+  if pd.isna(value):
+    return []
+
+  if isinstance(value, list):
+    return value
+
+  try:
+    parsed = json.loads(value)
+  except (TypeError, ValueError, json.JSONDecodeError):
+    return []
+
+  return parsed if isinstance(parsed, list) else []
+
+
+def _label_from_position(position, option_count):
+  if position < 1:
+    return None
+
+  upper_bound = min(option_count, 26)
+  if upper_bound < 1 or position > upper_bound:
+    return None
+
+  return chr(ord("A") + position - 1)
+
+
+def _infer_position_label(answer_value, option_count):
+  text = _normalize_text(answer_value)
+  if not text:
+    return None
+
+  match = OPTION_INDEX_RE.match(text)
+  if match:
+    return _label_from_position(int(match.group(1)), option_count)
+
+  if text.isdigit():
+    return _label_from_position(int(text), option_count)
+
+  return None
+
+
+def _extract_answer_label(answer_value, options_value):
+  answer_label = _normalize_label(answer_value)
+  if answer_label:
+    return answer_label
+
+  options = _safe_load_options(options_value)
+
+  position_label = _infer_position_label(answer_value, len(options))
+  if position_label:
+    return position_label
+
+  answer_text = _normalize_text(answer_value)
+  answer_key = _normalize_lookup_key(answer_value)
+  if not answer_text and not answer_key:
+    return None
+
+  for index, option in enumerate(options):
+    label = chr(ord("A") + index)
+    if answer_text and _normalize_text(option) == answer_text:
+      return label
+    if answer_key and _normalize_lookup_key(option) == answer_key:
       return label
 
-  for label in labels:
-    if raw_upper.startswith(label) and len(raw_upper) > 1:
-      next_char = raw_upper[1]
-      if not next_char.isalnum():
-        return label
-
-  norm_raw = _normalize_text(raw)
-  for idx, opt in enumerate(options):
-    if _normalize_text(opt) == norm_raw:
-      return labels[idx]
-
-  return raw
+  return None
 
 
 def run_benchmark(config):
@@ -157,7 +225,11 @@ def run_benchmark(config):
 
   # 4. Der Loop
   processed_count = 0
+  skipped_by_config = 0
   max_q = config.get("max_questions", 999999)  # Default: kein Limit
+  skip_ids = set(config.get("skip_question_ids", []))
+  if skip_ids:
+    print(f"Zusatz-Skip-Liste aktiv: {len(skip_ids)} IDs.")
 
   # Datei im Append-Modus öffnen
   with open(OUTPUT_FILE, "a", encoding="utf-8") as f_out:
@@ -169,10 +241,18 @@ def run_benchmark(config):
         print(f"Tages-Limit von {max_q} Fragen erreicht. Beende Job.")
         break
 
-      q_id = row["question_id"]
+      try:
+        q_id = int(row["question_id"])
+      except Exception:
+        q_id = row["question_id"]
 
       # Skip wenn schon erledigt
       if q_id in completed_ids:
+        continue
+
+      # Skip IDs aus der Job-Konfig (z. B. bekannte Problemfragen)
+      if q_id in skip_ids:
+        skipped_by_config += 1
         continue
 
       lang = config["language"]
@@ -185,10 +265,6 @@ def run_benchmark(config):
         q_text = row.get("question", "")
         opts_text = row.get("options_json", "[]")
 
-      options = _parse_options(opts_text)
-      labels = _labels_for(options) if options else []
-      options_block = _format_options(options, labels) if options else str(opts_text)
-
       # Sicherheits-Check: Leere Fragen skippen
       if pd.isna(q_text) or str(q_text).strip() == "":
         print(f"Warnung: Leerer Text für ID {q_id}. Skipping.")
@@ -197,10 +273,10 @@ def run_benchmark(config):
       # Prompt bauen
       prompt = PROMPT_TEMPLATES[lang].format(
         question=q_text,
-        options=options_block
+        options=opts_text
       )
 
-      print(f"ID {q_id} ({index + 1}/{total_questions}) ... ", end="", flush=True)
+      print(f"ID {q_id} ({index + 1}/{total_questions}) ... ", end="")
       start_ts = time.time()
 
       # API Call
@@ -210,11 +286,10 @@ def run_benchmark(config):
 
       # Ergebnis nur speichern, wenn gültiges JSON zurückkommt
       if isinstance(response_data, dict):
-        answer_raw = response_data.get("answer_char")
-        answer_char = _normalize_answer(answer_raw, options, labels)
-        answer_label = _normalize_label(answer_char)
-        correct_label = _normalize_label(row.get("answer"))
-        correct = 1 if answer_label and correct_label and answer_label == correct_label else 0
+        answer_char = _extract_answer_label(response_data.get("answer_char"), opts_text)
+        correct_answer = _normalize_label(row.get("answer"))
+        correct = 1 if answer_char and correct_answer and answer_char == correct_answer else 0
+
         result_entry = {
           "question_id": q_id,
           "category": row.get("category"),
@@ -226,7 +301,7 @@ def run_benchmark(config):
           "output_tokens": usage_data.get("output_tokens", 0),
           "logprob": usage_data.get("raw_logprob"),
           "top_choices": usage_data.get("top_choices", []),
-          "correct_answer": row.get("answer"),       
+          "correct_answer": correct_answer,
           "answer_char": answer_char,
           "correct": correct,
           "confidence": response_data.get("confidence"),
@@ -248,7 +323,7 @@ def run_benchmark(config):
       # Rate-Limit Schutz
       time.sleep(config["sleep_seconds"])
 
-  print(f"Job beendet. {processed_count}!")
+  print(f"Job beendet. {processed_count}! (skip IDs: {skipped_by_config})")
 
 
 if __name__ == "__main__":

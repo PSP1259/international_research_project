@@ -22,7 +22,6 @@ lib
   benchmark_engine.py
 01_prep_sample.py
 02_translate_sample.py
-03_convert_visualize.py
 check_status.py
 test_client.py
 
@@ -244,51 +243,6 @@ def translate_run():
 if __name__ == "__main__":
   translate_run()
 
-===== FILE: 03_convert_visualize.py =====
-import pandas as pd
-import json
-from pathlib import Path
-
-
-BASE_DIR = Path(__file__).resolve().parent
-INPUT_FILE = BASE_DIR.parent / "data" / "mmlu_sample_englisch.csv"
-OUTPUT_FILE = BASE_DIR.parent / "data" / "mmlu_sample.englisch.json"
-
-def convert_csv_to_json():
-    print(f"Lade CSV: {INPUT_FILE} ...")
-    
-    if not INPUT_FILE.exists():
-        print("FEHLER: Datei nicht gefunden!")
-        return
-
-    
-    df = pd.read_csv(INPUT_FILE)
-    
-    # 1. Optionen (JSON String -> Liste Objekt)
-    if "options_json" in df.columns:
-        df["options_json"] = df["options_json"].apply(lambda x: json.loads(x) if pd.notna(x) else [])
-        
-    if "options_de_json" in df.columns:
-        df["options_de_json"] = df["options_de_json"].apply(lambda x: json.loads(x) if pd.notna(x) else [])
-
-
-
-    # 2. DataFrame in ein Dictionary umwandeln (Liste von Records)
-    data_dict = df.to_dict(orient="records")
-
-
-
-    # 3. Als JSON speichern
-    print(f"Konvertiere {len(data_dict)} Zeilen zu JSON...")
-    
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        json.dump(data_dict, f, ensure_ascii=False, indent=2)
-
-    print(f"✅ FERTIG! JSON gespeichert unter:\n{OUTPUT_FILE}")
-    print("Du kannst diese Datei jetzt auf https://jsoncrack.com/editor hochladen.")
-
-if __name__ == "__main__":
-    convert_csv_to_json()
 
 ===== FILE: check_status.py =====
 import json

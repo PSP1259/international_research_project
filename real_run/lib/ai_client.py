@@ -43,7 +43,7 @@ class AIClient:
       if not api_key:
         raise ValueError("CRITICAL: GOOGLE_API_KEY fehlt in .env!")
       # HttpOptions.timeout is in milliseconds.
-      http_options = types.HttpOptions(timeout=60000)
+      http_options = types.HttpOptions(timeout=500000)
       self.client = genai.Client(api_key=api_key, http_options=http_options)
       # Gemini 3 preview models do not support logprobs in this setup.
       if self.model_name in {"gemini-3-flash-preview", "gemini-3-pro-preview"}:

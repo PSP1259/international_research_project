@@ -14,7 +14,7 @@ def test_gemini_genai():
         from google import genai
         client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
-        model = "gemini-3-flash"
+        model = "gemini-2.0-flash"
 
         t0 = time.time()
         resp = client.models.generate_content(

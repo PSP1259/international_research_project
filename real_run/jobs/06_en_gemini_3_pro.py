@@ -12,9 +12,13 @@ config = {
     "is_reasoning": False,
     "language": "EN",
     "sleep_seconds": 2.0,
-    "max_questions": 10
+    "max_questions": 300,
+    "skip_question_ids": []
 }
 
 
 if __name__ == "__main__":
     run_benchmark(config)
+
+
+

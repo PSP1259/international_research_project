@@ -12,7 +12,8 @@ config = {
     "is_reasoning": False,
     "language": "DE",
     "sleep_seconds": 2.0,
-    "max_questions": 100
+    "max_questions": 200,
+    "skip_question_ids": []
 }
 
 
