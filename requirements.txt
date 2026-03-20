@@ -1,5 +1,4 @@
-﻿# Direct project dependencies
-pandas==3.0.1
+﻿pandas==3.0.1
 numpy==2.4.2
 openai==2.29.0
 google-genai==1.68.0
